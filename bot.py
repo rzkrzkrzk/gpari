@@ -1,9 +1,10 @@
 import os
 import logging
-import sqlite3
 import random
 import time
 import asyncio
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from datetime import datetime
 
 from telegram import (
@@ -23,18 +24,20 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# Настройка логов
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Переменные окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не задан! Установите переменную окружения BOT_TOKEN.")
+    raise ValueError("BOT_TOKEN не задан!")
 
 ADMIN_LOGIN = os.getenv("ADMIN_LOGIN", "rzk1488")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "rzksigma")
-DB_PATH = os.getenv("DB_PATH", "grandpari.db")
+
+# Получаем DATABASE_URL из окружения
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL не задан! Создайте базу PostgreSQL в Railway.")
 
 # Состояния ConversationHandler
 (
@@ -49,88 +52,101 @@ DB_PATH = os.getenv("DB_PATH", "grandpari.db")
     BROADCAST_MSG,
 ) = range(9)
 
-# ---------- БАЗА ДАННЫХ ----------
+# ---------- БАЗА ДАННЫХ (PostgreSQL) ----------
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        balance INTEGER DEFAULT 5000,
-        last_roulette INTEGER DEFAULT 0
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS matches (
-        match_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        team1 TEXT,
-        team2 TEXT,
-        coef1 REAL,
-        coef2 REAL,
-        status TEXT DEFAULT 'OPEN',
-        winner INTEGER DEFAULT 0
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS bets (
-        bet_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        match_id INTEGER,
-        team_choice INTEGER,
-        amount INTEGER,
-        coef REAL,
-        status TEXT DEFAULT 'PENDING'
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS admins (
-        user_id INTEGER PRIMARY KEY
-    )''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            balance INTEGER DEFAULT 5000,
+            last_roulette INTEGER DEFAULT 0
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS matches (
+            match_id SERIAL PRIMARY KEY,
+            team1 TEXT,
+            team2 TEXT,
+            coef1 REAL,
+            coef2 REAL,
+            status TEXT DEFAULT 'OPEN',
+            winner INTEGER DEFAULT 0
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS bets (
+            bet_id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            match_id INTEGER,
+            team_choice INTEGER,
+            amount INTEGER,
+            coef REAL,
+            status TEXT DEFAULT 'PENDING'
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id BIGINT PRIMARY KEY
+        )
+    ''')
     conn.commit()
     conn.close()
 
 init_db()
 
-# Вспомогательные функции БД
+# Вспомогательные функции
 def get_user(user_id, username="", first_name=""):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT user_id, username, first_name, balance, last_roulette FROM users WHERE user_id = ?", (user_id,))
+    conn = get_db_connection()
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
     row = c.fetchone()
     if not row:
-        c.execute("INSERT INTO users (user_id, username, first_name, balance, last_roulette) VALUES (?, ?, ?, 5000, 0)",
-                  (user_id, username, first_name))
+        c.execute(
+            "INSERT INTO users (user_id, username, first_name, balance, last_roulette) VALUES (%s, %s, %s, 5000, 0)",
+            (user_id, username, first_name)
+        )
         conn.commit()
-        c.execute("SELECT user_id, username, first_name, balance, last_roulette FROM users WHERE user_id = ?", (user_id,))
+        c.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
         row = c.fetchone()
     else:
-        # Обновляем username если изменился
-        c.execute("UPDATE users SET username = ?, first_name = ? WHERE user_id = ?", (username, first_name, user_id))
+        # Обновляем username / first_name
+        c.execute("UPDATE users SET username = %s, first_name = %s WHERE user_id = %s", (username, first_name, user_id))
         conn.commit()
     conn.close()
-    return {"user_id": row[0], "username": row[1], "first_name": row[2], "balance": row[3], "last_roulette": row[4]}
+    return row
 
 def update_balance(user_id, delta):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (delta, user_id))
+    c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (delta, user_id))
     conn.commit()
     conn.close()
 
 def is_admin(user_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
+    c.execute("SELECT user_id FROM admins WHERE user_id = %s", (user_id,))
     row = c.fetchone()
     conn.close()
     return row is not None
 
 def add_admin(user_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,))
+    c.execute("INSERT INTO admins (user_id) VALUES (%s) ON CONFLICT DO NOTHING", (user_id,))
     conn.commit()
     conn.close()
 
 def remove_admin(user_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+    c.execute("DELETE FROM admins WHERE user_id = %s", (user_id,))
     conn.commit()
     conn.close()
 
@@ -189,9 +205,9 @@ async def user_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             (1500, "🚀 Вам выпало +1500 GCoin!")
         ]
         delta, msg = random.choice(options)
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
-        c.execute("UPDATE users SET balance = balance + ?, last_roulette = ? WHERE user_id = ?", (delta, now, user.id))
+        c.execute("UPDATE users SET balance = balance + %s, last_roulette = %s WHERE user_id = %s", (delta, now, user.id))
         conn.commit()
         conn.close()
         new_bal = u_data["balance"] + delta
@@ -199,8 +215,8 @@ async def user_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("Выберите следующее действие:", reply_markup=main_inline_keyboard())
 
     elif data == "make_bet":
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
+        conn = get_db_connection()
+        c = conn.cursor(cursor_factory=RealDictCursor)
         c.execute("SELECT match_id, team1, team2, coef1, coef2 FROM matches WHERE status = 'OPEN'")
         matches = c.fetchall()
         conn.close()
@@ -210,26 +226,24 @@ async def user_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             return
         buttons = []
         for m in matches:
-            m_id, t1, t2, c1, c2 = m
-            buttons.append([InlineKeyboardButton(f"⚽ {t1} ({c1}) vs {t2} ({c2})", callback_data=f"select_match_{m_id}")])
+            buttons.append([InlineKeyboardButton(f"⚽ {m['team1']} ({m['coef1']}) vs {m['team2']} ({m['coef2']})", callback_data=f"select_match_{m['match_id']}")])
         await query.message.reply_text("🏆 **Выберите матч для ставки:**", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
 
     elif data.startswith("select_match_"):
         match_id = int(data.split("_")[2])
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT team1, team2, coef1, coef2 FROM matches WHERE match_id = ? AND status = 'OPEN'", (match_id,))
+        conn = get_db_connection()
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute("SELECT team1, team2, coef1, coef2 FROM matches WHERE match_id = %s AND status = 'OPEN'", (match_id,))
         match = c.fetchone()
         conn.close()
         if not match:
             await query.message.reply_text("❌ Этот матч недоступен.")
             return
-        t1, t2, c1, c2 = match
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"Победа {t1} (кэф {c1})", callback_data=f"place_bet_{match_id}_1_{c1}")],
-            [InlineKeyboardButton(f"Победа {t2} (кэф {c2})", callback_data=f"place_bet_{match_id}_2_{c2}")],
+            [InlineKeyboardButton(f"Победа {match['team1']} (кэф {match['coef1']})", callback_data=f"place_bet_{match_id}_1_{match['coef1']}")],
+            [InlineKeyboardButton(f"Победа {match['team2']} (кэф {match['coef2']})", callback_data=f"place_bet_{match_id}_2_{match['coef2']}")],
         ])
-        await query.message.reply_text(f"⚔️ **Матч:** {t1} vs {t2}\nВыберите исход:", reply_markup=kb, parse_mode="Markdown")
+        await query.message.reply_text(f"⚔️ **Матч:** {match['team1']} vs {match['team2']}\nВыберите исход:", reply_markup=kb, parse_mode="Markdown")
 
     elif data.startswith("place_bet_"):
         parts = data.split("_")
@@ -257,17 +271,19 @@ async def process_bet_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
     team_choice = context.user_data.get("bet_team_choice")
     coef = context.user_data.get("bet_coef")
     update_balance(user.id, -amount)
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("INSERT INTO bets (user_id, match_id, team_choice, amount, coef, status) VALUES (?, ?, ?, ?, ?, 'PENDING')",
-              (user.id, match_id, team_choice, amount, coef))
+    c.execute(
+        "INSERT INTO bets (user_id, match_id, team_choice, amount, coef, status) VALUES (%s, %s, %s, %s, %s, 'PENDING')",
+        (user.id, match_id, team_choice, amount, coef)
+    )
     conn.commit()
     conn.close()
     await update.message.reply_text(f"✅ Ставка **{amount} GCoin** успешно принята!\nКоэффициент: **{coef}**", parse_mode="Markdown")
     await update.message.reply_text("Выберите следующее действие:", reply_markup=main_inline_keyboard())
     return ConversationHandler.END
 
-# ---------- АДМИН-ПАНЕЛЬ (АВТОРИЗАЦИЯ) ----------
+# ---------- АДМИН-ПАНЕЛЬ ----------
 async def adminka_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if is_admin(user_id):
@@ -309,8 +325,8 @@ async def admin_buttons_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return ADD_MATCH_TEAM1
 
     elif text == "❌ Удалить/Завершить матч":
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
+        conn = get_db_connection()
+        c = conn.cursor(cursor_factory=RealDictCursor)
         c.execute("SELECT match_id, team1, team2 FROM matches WHERE status = 'OPEN'")
         matches = c.fetchall()
         conn.close()
@@ -319,9 +335,8 @@ async def admin_buttons_handler(update: Update, context: ContextTypes.DEFAULT_TY
             return
         buttons = []
         for m in matches:
-            m_id, t1, t2 = m
-            buttons.append([InlineKeyboardButton(f"🏁 Завершить: {t1} vs {t2}", callback_data=f"adm_end_{m_id}")])
-            buttons.append([InlineKeyboardButton(f"🗑 Удалить: {t1} vs {t2}", callback_data=f"adm_del_{m_id}")])
+            buttons.append([InlineKeyboardButton(f"🏁 Завершить: {m['team1']} vs {m['team2']}", callback_data=f"adm_end_{m['match_id']}")])
+            buttons.append([InlineKeyboardButton(f"🗑 Удалить: {m['team1']} vs {m['team2']}", callback_data=f"adm_del_{m['match_id']}")])
         await update.message.reply_text("Выберите действие с матчем:", reply_markup=InlineKeyboardMarkup(buttons))
 
     elif text == "💸 Выдать денег":
@@ -359,9 +374,12 @@ async def add_match_c2(update: Update, context: ContextTypes.DEFAULT_TYPE):
         t1 = context.user_data["m_t1"]
         t2 = context.user_data["m_t2"]
         c1 = context.user_data["m_c1"]
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
-        c.execute("INSERT INTO matches (team1, team2, coef1, coef2) VALUES (?, ?, ?, ?)", (t1, t2, c1, c2))
+        c.execute(
+            "INSERT INTO matches (team1, team2, coef1, coef2) VALUES (%s, %s, %s, %s)",
+            (t1, t2, c1, c2)
+        )
         conn.commit()
         conn.close()
         await update.message.reply_text(f"✅ Матч создан!\n⚽ {t1} ({c1}) vs {t2} ({c2})", reply_markup=admin_reply_keyboard())
@@ -370,7 +388,7 @@ async def add_match_c2(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Введите число (например 2.10):")
         return ADD_MATCH_COEF2
 
-# --- Управление матчами (Завершение/Удаление) ---
+# --- Управление матчами ---
 async def admin_match_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -378,50 +396,50 @@ async def admin_match_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if data.startswith("adm_del_"):
         match_id = int(data.split("_")[2])
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
-        c.execute("DELETE FROM matches WHERE match_id = ?", (match_id,))
+        c.execute("DELETE FROM matches WHERE match_id = %s", (match_id,))
         conn.commit()
         conn.close()
         await query.message.edit_text("🗑 Матч удален!")
 
     elif data.startswith("adm_end_"):
         match_id = int(data.split("_")[2])
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT team1, team2 FROM matches WHERE match_id = ?", (match_id,))
+        conn = get_db_connection()
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute("SELECT team1, team2 FROM matches WHERE match_id = %s", (match_id,))
         m = c.fetchone()
         conn.close()
         if not m:
             await query.message.edit_text("❌ Матч не найден.")
             return
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"🏆 Победил {m[0]} (Команда 1)", callback_data=f"settle_{match_id}_1")],
-            [InlineKeyboardButton(f"🏆 Победил {m[1]} (Команда 2)", callback_data=f"settle_{match_id}_2")],
+            [InlineKeyboardButton(f"🏆 Победил {m['team1']} (Команда 1)", callback_data=f"settle_{match_id}_1")],
+            [InlineKeyboardButton(f"🏆 Победил {m['team2']} (Команда 2)", callback_data=f"settle_{match_id}_2")],
         ])
-        await query.message.edit_text(f"Выберите победителя матча {m[0]} vs {m[1]}:", reply_markup=kb)
+        await query.message.edit_text(f"Выберите победителя матча {m['team1']} vs {m['team2']}:", reply_markup=kb)
 
     elif data.startswith("settle_"):
         parts = data.split("_")
         match_id = int(parts[1])
         winner = int(parts[2])
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
-        c.execute("UPDATE matches SET status = 'FINISHED', winner = ? WHERE match_id = ?", (winner, match_id))
-        c.execute("SELECT bet_id, user_id, team_choice, amount, coef FROM bets WHERE match_id = ? AND status = 'PENDING'", (match_id,))
+        c.execute("UPDATE matches SET status = 'FINISHED', winner = %s WHERE match_id = %s", (winner, match_id))
+        c.execute("SELECT bet_id, user_id, team_choice, amount, coef FROM bets WHERE match_id = %s AND status = 'PENDING'", (match_id,))
         bets = c.fetchall()
         for b in bets:
             bet_id, u_id, t_choice, amount, coef = b
             if t_choice == winner:
                 win_amount = int(amount * coef)
-                c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (win_amount, u_id))
-                c.execute("UPDATE bets SET status = 'WON' WHERE bet_id = ?", (bet_id,))
+                c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (win_amount, u_id))
+                c.execute("UPDATE bets SET status = 'WON' WHERE bet_id = %s", (bet_id,))
                 try:
                     await context.bot.send_message(u_id, f"🎉 Ваша ставка на матч выиграла!\nЗачислено: **{win_amount} GCoin**", parse_mode="Markdown")
                 except Exception:
                     pass
             else:
-                c.execute("UPDATE bets SET status = 'LOST' WHERE bet_id = ?", (bet_id,))
+                c.execute("UPDATE bets SET status = 'LOST' WHERE bet_id = %s", (bet_id,))
                 try:
                     await context.bot.send_message(u_id, f"❌ Ваша ставка на матч не сыграла.")
                 except Exception:
@@ -442,16 +460,16 @@ async def process_give_money(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except ValueError:
         await update.message.reply_text("❌ Сумма должна быть целым числом!")
         return GIVE_MONEY
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT user_id, balance FROM users WHERE username = ?", (username,))
+    conn = get_db_connection()
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("SELECT user_id, balance FROM users WHERE username = %s", (username,))
     row = c.fetchone()
     if not row:
         conn.close()
         await update.message.reply_text("❌ Пользователь с таким username не найден в базе бота.")
         return ConversationHandler.END
-    target_id, old_bal = row
-    c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, target_id))
+    target_id = row["user_id"]
+    c.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s", (amount, target_id))
     conn.commit()
     conn.close()
     await update.message.reply_text(f"✅ Пользователю @{username} выдано **{amount} GCoin**!", reply_markup=admin_reply_keyboard(), parse_mode="Markdown")
@@ -464,7 +482,7 @@ async def process_give_money(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # --- Рассылка ---
 async def process_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT user_id FROM users")
     users = c.fetchall()
@@ -544,7 +562,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.Regex("^(❌ Удалить/Завершить матч|🚪 Выйти с админки)$"), admin_buttons_handler))
 
-    logger.info("Бот запущен...")
+    logger.info("Бот запущен с PostgreSQL...")
     app.run_polling()
 
 if __name__ == "__main__":
